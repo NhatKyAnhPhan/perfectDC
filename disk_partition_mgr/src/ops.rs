@@ -4,7 +4,9 @@
 //! Disk Management của Windows sử dụng — nên việc thu nhỏ/mở rộng NTFS,
 //! tạo/định dạng phân vùng được xử lý an toàn bởi Windows.
 
+use crate::disk_info::{self, Mode};
 use crate::model::{self, DiskDto, MIB, align_down, free_letters, used_letters};
+use crate::planner;
 use crate::sys;
 
 const MIN_PART_MIB: u64 = 16;
@@ -66,6 +68,14 @@ pub enum Action {
         partition: u32,
         size: u64,
     },
+    /// Thu nhỏ phân vùng dữ liệu, dời nó sang phải rồi mở rộng phân vùng hệ thống
+    /// (thường là C:) vào khoảng trống vừa tạo ra.
+    MoveSpaceToSystem {
+        disk: u32,
+        system: u32,
+        source: u32,
+        source_new_size: u64,
+    },
     Delete {
         disk: u32,
         partition: u32,
@@ -96,6 +106,7 @@ impl Action {
             Action::Create { .. } => "Tạo phân vùng mới",
             Action::Split { .. } => "Chia ổ đĩa",
             Action::Extend { .. } => "Mở rộng phân vùng",
+            Action::MoveSpaceToSystem { .. } => "Chuyển dung lượng sang ổ hệ thống",
             Action::Delete { .. } => "Xoá phân vùng",
             Action::Format { .. } => "Định dạng phân vùng",
             Action::SetLetter { .. } => "Đổi ký tự ổ đĩa",
@@ -109,6 +120,7 @@ impl Action {
         match self {
             Action::Delete { .. } => Some("DELETE"),
             Action::Format { .. } => Some("FORMAT"),
+            Action::MoveSpaceToSystem { .. } => Some("MOVE"),
             Action::Wipe { .. } => Some("ERASE"),
             Action::Initialize { .. } => Some("INIT"),
             _ => None,
@@ -160,6 +172,18 @@ impl Action {
                 partition,
                 disk,
                 model::human_bytes(*size)
+            ),
+            Action::MoveSpaceToSystem {
+                disk,
+                system,
+                source,
+                source_new_size,
+            } => format!(
+                "Chuyển dung lượng trên đĩa {}: thu nhỏ phân vùng #{} còn {}, dời sang phải và mở rộng phân vùng hệ thống #{}",
+                disk,
+                source,
+                model::human_bytes(*source_new_size),
+                system
             ),
             Action::Delete { disk, partition } => {
                 format!("Xoá phân vùng #{} trên đĩa {}", partition, disk)
@@ -329,6 +353,73 @@ impl Action {
                     return Err(format!(
                         "Tối đa có thể mở rộng lên {}.",
                         model::human_bytes(p.max_size)
+                    ));
+                }
+                Ok(())
+            }
+            Action::MoveSpaceToSystem {
+                disk,
+                system,
+                source,
+                source_new_size,
+            } => {
+                let d = get_disk(*disk)?;
+                ensure_disk_writable(d)?;
+                let t = get_part(d, *system)?;
+                let s = get_part(d, *source)?;
+                if !(t.is_boot || t.is_system) || t.letter_opt().is_none() {
+                    return Err(
+                        "Phân vùng đích phải là phân vùng hệ thống có ký tự ổ (ví dụ C:).".into(),
+                    );
+                }
+                if s.is_boot || s.is_system || s.kind.eq_ignore_ascii_case("reserved") {
+                    return Err(
+                        "Phân vùng nguồn không được là phân vùng hệ thống hoặc dự phòng.".into(),
+                    );
+                }
+                if s.letter_opt().is_none() {
+                    return Err("Phân vùng nguồn phải có ký tự ổ.".into());
+                }
+                if !s.fs.eq_ignore_ascii_case("NTFS") {
+                    return Err("Chỉ hỗ trợ phân vùng nguồn NTFS.".into());
+                }
+                if s.bitlocker_on() {
+                    return Err(
+                        "Phân vùng nguồn đang bật BitLocker. Hãy tắt/suspend BitLocker trước."
+                            .into(),
+                    );
+                }
+                let t_end = t.offset.saturating_add(t.size);
+                if t_end > s.offset || s.offset - t_end > MIB {
+                    return Err(
+                        "Phân vùng nguồn phải nằm liền ngay sau phân vùng hệ thống.".into(),
+                    );
+                }
+                let size = *source_new_size;
+                if size % MIB != 0 {
+                    return Err("Kích thước phải là bội số của 1 MB.".into());
+                }
+                if size < 512 * MIB {
+                    return Err("Phân vùng nguồn phải giữ tối thiểu 512 MB.".into());
+                }
+                if size >= s.size {
+                    return Err("Dung lượng mới phải nhỏ hơn dung lượng hiện tại.".into());
+                }
+                if s.size - size < size {
+                    return Err(format!(
+                        "Để an toàn, phân vùng nguồn phải giữ tối đa {} (50% hiện tại).",
+                        model::human_bytes(s.size / 2)
+                    ));
+                }
+                let min_keep = s
+                    .min_size
+                    .max(s.used().saturating_add(256 * MIB))
+                    .max(512 * MIB);
+                if size < min_keep {
+                    return Err(format!(
+                        "Không thể thu nhỏ: cần giữ lại ít nhất {} (dữ liệu đang dùng {}).",
+                        model::human_bytes(min_keep),
+                        model::human_bytes(s.used())
                     ));
                 }
                 Ok(())

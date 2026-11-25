@@ -2,7 +2,8 @@
 //! căn chỉnh offset/sector, phát hiện va chạm/biên giới, xây dựng các bước copy.
 
 use crate::disk_info::{
-    DiskInfo, Mode, PartitionInfo, close_disk, copy_range_h, open_disk, read_disk,
+    DiskInfo, Mode, PartitionInfo, close_disk, flush_handle, open_disk, read_at, read_disk,
+    write_at,
 };
 
 /// Hướng dời phân vùng: `left` = về phía đầu đĩa (offset giảm), `right` = về phía cuối đĩa (offset tăng).
@@ -114,10 +115,11 @@ pub fn align_down(n: u64, align: u64) -> u64 {
     n / align * align
 }
 
-/// Kích thước block copy mặc định (căn chỉnh theo sector, tối đa 1 MiB).
+/// Kích thước block copy mặc định (4 MiB, căn chỉnh theo sector).
 pub fn chunk_size(sector: u64) -> u64 {
     let s = sector.max(512);
-    s.saturating_mul(32).min(1024 * 1024)
+    let blocks = ((4 * 1024 * 1024) / s).max(1);
+    blocks * s
 }
 
 /// Danh sách các phân vùng trùng với `[start, end)` (loại trừ phân vùng `exclude`).
@@ -269,6 +271,18 @@ fn build_steps(
 /// Thực thi kế hoạch: re-validate (đọc lại đĩa, kiểm tra va chạm/biên giới) rồi copy theo các bước.
 /// Trả về số bytes đã copy. Nếu trạng thái đĩa đã thay đổi kể từ khi lập kế hoạch → lỗi, không ghi.
 pub fn execute_move(plan: &Plan) -> Result<u64, String> {
+    execute_move_with(plan, true, |_, _| {})
+}
+
+/// Như [`execute_move`] nhưng cho phép tắt in từng bước và báo tiến độ `(đã_copy, tổng)`.
+///
+/// Dùng một buffer 4 MiB dùng lại cho mọi bước để tránh cấp phát liên tục khi
+/// di chuyển phân vùng lớn.
+pub fn execute_move_with(
+    plan: &Plan,
+    verbose: bool,
+    mut progress: impl FnMut(u64, u64),
+) -> Result<u64, String> {
     let disk = read_disk(&plan.disk_path, Mode::ReadWrite)?;
     let recomputed = plan_move(
         &disk,
@@ -284,23 +298,45 @@ pub fn execute_move(plan: &Plan) -> Result<u64, String> {
         );
     }
     let h = open_disk(&plan.disk_path, Mode::ReadWrite)?;
+    let chunk = chunk_size(plan.sector_size);
+    let mut buf = vec![0u8; chunk as usize];
     let mut copied = 0u64;
-    for step in &plan.copy_steps {
-        let n = copy_range_h(h, step.src_offset, step.dst_offset, step.size)?;
-        copied += n;
-        println!(
-            "  Bước {}/{}: read  0x{:016X} len 0x{:X}",
-            step.index,
-            plan.copy_steps.len(),
-            step.src_offset,
-            step.size
-        );
-        println!(
-            "                 write 0x{:016X} len 0x{:X}",
-            step.dst_offset, step.size
-        );
-    }
+    let total = plan.old_length;
+    let result = (|| -> Result<(), String> {
+        for step in &plan.copy_steps {
+            let n = step.size as usize;
+            if n == 0 || n > buf.len() {
+                return Err(format!("Bước copy không hợp lệ: {} bytes.", step.size));
+            }
+            let r = read_at(h, step.src_offset, &mut buf[..n])?;
+            if r != n {
+                return Err(format!(
+                    "Đọc thiếu dữ liệu tại offset 0x{:X}: cần {n}, nhận {r}.",
+                    step.src_offset
+                ));
+            }
+            write_at(h, step.dst_offset, &buf[..n])?;
+            copied += n as u64;
+            progress(copied, total);
+            if verbose {
+                println!(
+                    "  Bước {}/{}: read  0x{:016X} len 0x{:X}",
+                    step.index,
+                    plan.copy_steps.len(),
+                    step.src_offset,
+                    step.size
+                );
+                println!(
+                    "                 write 0x{:016X} len 0x{:X}",
+                    step.dst_offset, step.size
+                );
+            }
+        }
+        Ok(())
+    })();
+    flush_handle(h);
     close_disk(h);
+    result?;
     Ok(copied)
 }
 
@@ -387,17 +423,13 @@ mod tests {
         assert_eq!(plan.delta, 0x800);
         assert_eq!(plan.old_start, 0x20000);
         assert_eq!(plan.old_length, 0x10000);
-        // chunk = 512*32 = 16384 → 4 blocks
-        assert_eq!(plan.copy_steps.len(), 4);
-        // Right: copy từ cuối về đầu (grav bằng dst > src).
+        // chunk = 4 MiB → toàn bộ 0x10000 bytes nằm trong 1 bước.
+        assert_eq!(plan.copy_steps.len(), 1);
         let first = &plan.copy_steps[0];
         assert_eq!(first.index, 1);
-        assert_eq!(first.src_offset, 0x20000 + 3 * 0x4000);
-        assert_eq!(first.dst_offset, 0x20800 + 3 * 0x4000);
-        assert_eq!(first.size, 0x4000);
-        let last = &plan.copy_steps[3];
-        assert_eq!(last.src_offset, 0x20000);
-        assert_eq!(last.dst_offset, 0x20800);
+        assert_eq!(first.src_offset, 0x20000);
+        assert_eq!(first.dst_offset, 0x20800);
+        assert_eq!(first.size, 0x10000);
     }
 
     #[test]
@@ -407,12 +439,11 @@ mod tests {
         let plan = plan_move(&d, 2, Direction::Left, 4).unwrap();
         assert_eq!(plan.new_start, 0x40000 - 4 * 512);
         assert_eq!(plan.delta, -(4 * 512));
-        assert_eq!(plan.copy_steps.len(), 2); // 0x8000 = 2 * 0x4000
+        assert_eq!(plan.copy_steps.len(), 1);
         // Left: copy từ đầu về cuối (grav bằng dst < src).
         assert_eq!(plan.copy_steps[0].src_offset, 0x40000);
         assert_eq!(plan.copy_steps[0].dst_offset, 0x3F800);
-        assert_eq!(plan.copy_steps[1].src_offset, 0x40000 + 0x4000);
-        assert_eq!(plan.copy_steps[1].dst_offset, 0x3F800 + 0x4000);
+        assert_eq!(plan.copy_steps[0].size, 0x8000);
     }
 
     #[test]

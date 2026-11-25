@@ -23,8 +23,8 @@ use windows_sys::Win32::Foundation::{
     CloseHandle, GENERIC_READ, GENERIC_WRITE, GetLastError, HANDLE, INVALID_HANDLE_VALUE,
 };
 use windows_sys::Win32::Storage::FileSystem::{
-    CreateFileW, FILE_BEGIN, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, GetFileSizeEx,
-    OPEN_EXISTING, ReadFile, SetFilePointerEx, WriteFile,
+    CreateFileW, FILE_BEGIN, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
+    FlushFileBuffers, GetFileSizeEx, OPEN_EXISTING, ReadFile, SetFilePointerEx, WriteFile,
 };
 use windows_sys::Win32::System::IO::DeviceIoControl;
 use windows_sys::Win32::System::Ioctl::{
@@ -380,6 +380,59 @@ pub fn copy_range_h(h: HANDLE, src: u64, dst: u64, len: u64) -> Result<u64, Stri
         total += r as u64;
     }
     Ok(total)
+}
+
+/// Xả bộ đệm của handle xuống thiết bị (bỏ qua lỗi không hỗ trợ).
+pub fn flush_handle(h: HANDLE) {
+    unsafe {
+        FlushFileBuffers(h);
+    }
+}
+
+/// So sánh hai vùng `[a, a+len)` và `[b, b+len)` trên cùng một đĩa.
+///
+/// Dùng để xác minh bản sao sector trước khi thay đổi bảng phân vùng. Trả về lỗi
+/// kèm offset lệch đầu tiên nếu dữ liệu không khớp.
+pub fn verify_region_equal(
+    disk_path: &str,
+    a: u64,
+    b: u64,
+    len: u64,
+    mut report: impl FnMut(u64),
+) -> Result<(), String> {
+    const CHUNK: u64 = 4 * 1024 * 1024;
+    let h = open_disk(disk_path, Mode::Read)?;
+    let mut buf_a = vec![0u8; CHUNK as usize];
+    let mut buf_b = vec![0u8; CHUNK as usize];
+    let mut off = 0u64;
+    let result = loop {
+        if off >= len {
+            break Ok(());
+        }
+        let n = (len - off).min(CHUNK) as usize;
+        if let Err(e) = read_at(h, a + off, &mut buf_a[..n]) {
+            break Err(e);
+        }
+        if let Err(e) = read_at(h, b + off, &mut buf_b[..n]) {
+            break Err(e);
+        }
+        if buf_a[..n] != buf_b[..n] {
+            let diff = buf_a[..n]
+                .iter()
+                .zip(buf_b[..n].iter())
+                .position(|(x, y)| x != y)
+                .unwrap_or(0) as u64;
+            break Err(format!(
+                "Dữ liệu sao chép không khớp tại offset 0x{:X} (nguồn 0x{:X}).",
+                b + off + diff,
+                a + off + diff
+            ));
+        }
+        off += n as u64;
+        report(off);
+    };
+    close_disk(h);
+    result
 }
 
 // ---------------------------------------------------------------------------
