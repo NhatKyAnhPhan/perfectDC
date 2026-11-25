@@ -2,6 +2,7 @@
 
 use crate::disk_info::{self, DiskInfo, Mode};
 use crate::planner::{self, Direction, Plan};
+use crate::sys;
 
 pub fn run(args: Vec<String>) -> Result<(), String> {
     if args.iter().any(|a| a == "-h" || a == "--help") {
@@ -12,7 +13,7 @@ pub fn run(args: Vec<String>) -> Result<(), String> {
         Some("inspect") => cmd_inspect(&args[1..]),
         Some("plan-move") => cmd_plan_move(&args[1..]),
         Some("--version") | Some("-v") => {
-            println!("disk_partition_mgr 0.1.0");
+            println!("PerfectDS {}", env!("CARGO_PKG_VERSION"));
             Ok(())
         }
         Some(other) => {
@@ -28,9 +29,10 @@ pub fn run(args: Vec<String>) -> Result<(), String> {
 
 fn print_usage() {
     println!(
-        r#"disk_partition_mgr — kiểm tra và mô phỏng thao tác quản lý phân vùng đĩa (Windows)
+        r#"PerfectDS — kiểm tra và mô phỏng thao tác quản lý phân vùng đĩa (Windows)
 
 ⚠️  Mặc định luôn là dry-run: không ghi đĩa thật trừ khi truyền --apply.
+   Đọc đĩa vật lý cần chạy bằng quyền Administrator.
 
 Lệnh:
   inspect [--disk <đường_dẫn>]   Hiển thị thông tin đĩa (kích thước, sector, phân vùng, unallocated);
@@ -48,9 +50,9 @@ Tham số:
   --dry-run         Chỉ in kế hoạch (mặc định)
 
 Ví dụ:
-  disk_partition_mgr inspect
-  disk_partition_mgr inspect --disk \\?\C:\test\disk.vhd
-  disk_partition_mgr plan-move --disk \\?\PhysicalDrive0 --partition 2 --direction right --offset-sectors 16 --dry-run"#
+  dpm-cli.exe inspect
+  dpm-cli.exe inspect --disk \\?\C:\test\disk.vhd
+  dpm-cli.exe plan-move --disk \\.\PhysicalDrive0 --partition 2 --direction right --offset-sectors 16 --dry-run"#
     );
 }
 
@@ -124,6 +126,11 @@ fn cmd_inspect(args: &[String]) -> Result<(), String> {
             let drives = disk_info::list_physical_drives();
             if drives.is_empty() {
                 println!("Không tìm thấy đĩa vật lý nào.");
+                if sys::is_admin() {
+                    println!("Gợi ý: dùng --disk <đường_dẫn> để đọc file ảnh (.vhd).");
+                } else {
+                    println!("Gợi ý: hãy chạy lại bằng quyền Administrator để đọc đĩa vật lý.");
+                }
                 return Ok(());
             }
             println!(
@@ -142,10 +149,7 @@ fn cmd_inspect(args: &[String]) -> Result<(), String> {
                         human_size(info.size_bytes),
                         info.style.as_str()
                     ),
-                    Err(e) => println!(
-                        "  {} — Lỗi: {e}",
-                        disk_info::physical_drive_path(i)
-                    ),
+                    Err(e) => println!("  {} — Lỗi: {e}", disk_info::physical_drive_path(i)),
                 }
             }
         }
@@ -198,7 +202,7 @@ fn cmd_plan_move(args: &[String]) -> Result<(), String> {
         .ok_or("Thiếu --disk (đĩa vật lý hoặc file ảnh .vhd)")?
         .to_string();
     let partition = o.opt_u32("partition").ok_or("Thiếu --partition")?;
-    let direction = parse_direction(&o.opt("direction").ok_or("Thiếu --direction (left|right)")?)?;
+    let direction = parse_direction(o.opt("direction").ok_or("Thiếu --direction (left|right)")?)?;
     let offset_sectors = o.opt_u64("offset-sectors").unwrap_or(0);
     let apply = o.has_flag("apply");
     let mode = if apply { Mode::ReadWrite } else { Mode::Read };
@@ -243,7 +247,11 @@ fn print_plan(plan: &Plan) {
         "  Delta:            {} bytes ({} sector{})",
         plan.delta,
         plan.delta / sector as i64,
-        if (plan.delta / sector as i64) == 1 { "" } else { "s" }
+        if (plan.delta / sector as i64) == 1 {
+            ""
+        } else {
+            "s"
+        }
     );
     println!("  Căn chỉnh:        new_start căn chỉnh theo sector size ({sector} B)");
     println!(

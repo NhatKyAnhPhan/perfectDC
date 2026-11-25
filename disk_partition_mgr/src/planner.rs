@@ -1,7 +1,9 @@
 //! Module tính toán kế hoạch dời phân vùng:
 //! căn chỉnh offset/sector, phát hiện va chạm/biên giới, xây dựng các bước copy.
 
-use crate::disk_info::{close_disk, copy_range_h, DiskInfo, Mode, open_disk, PartitionInfo, read_disk};
+use crate::disk_info::{
+    DiskInfo, Mode, PartitionInfo, close_disk, copy_range_h, open_disk, read_disk,
+};
 
 /// Hướng dời phân vùng: `left` = về phía đầu đĩa (offset giảm), `right` = về phía cuối đĩa (offset tăng).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -145,10 +147,12 @@ pub fn plan_move(
     offset_sectors: u64,
 ) -> Result<Plan, PlanError> {
     let sector = disk.sector_size.max(1) as u64;
-    let p = disk.partition_by_number(partition_number).ok_or(PlanError::PartitionNotFound {
-        number: partition_number,
-        available: disk.partitions.iter().map(|x| x.number).collect(),
-    })?;
+    let p = disk
+        .partition_by_number(partition_number)
+        .ok_or(PlanError::PartitionNotFound {
+            number: partition_number,
+            available: disk.partitions.iter().map(|x| x.number).collect(),
+        })?;
     let abs_delta = offset_sectors.saturating_mul(sector);
     let signed = abs_delta.min(i64::MAX as u64) as i64;
     let raw_start = p.start_offset as i64
@@ -163,11 +167,13 @@ pub fn plan_move(
         Direction::Left => align_down(raw_start as u64, sector),
     };
     let delta = new_start as i64 - p.start_offset as i64;
-    let new_end = new_start.checked_add(p.length).ok_or(PlanError::OutOfBounds {
-        target_start: new_start,
-        length: p.length,
-        disk_size: disk.size_bytes,
-    })?;
+    let new_end = new_start
+        .checked_add(p.length)
+        .ok_or(PlanError::OutOfBounds {
+            target_start: new_start,
+            length: p.length,
+            disk_size: disk.size_bytes,
+        })?;
     if new_end > disk.size_bytes {
         return Err(PlanError::OutOfBounds {
             target_start: new_start,
@@ -219,7 +225,12 @@ pub fn plan_move(
 /// Xây dựng danh sách bước copy (đã căn chỉnh thứ tự để tránh đè dữ liệu chưa đọc):
 /// - right: copy từ cuối về đầu (`dst > src`, ghi ở trên các reads chưa tới).
 /// - left: copy từ đầu về cuối (`dst < src`, ghi ở dưới các reads tiếp theo).
-fn build_steps(p: &PartitionInfo, new_start: u64, direction: Direction, sector: u64) -> Vec<CopyStep> {
+fn build_steps(
+    p: &PartitionInfo,
+    new_start: u64,
+    direction: Direction,
+    sector: u64,
+) -> Vec<CopyStep> {
     let chunk = chunk_size(sector);
     let total_blocks = p.length.div_ceil(chunk);
     let mut steps = Vec::with_capacity(total_blocks.min(1 << 20) as usize);
@@ -259,8 +270,13 @@ fn build_steps(p: &PartitionInfo, new_start: u64, direction: Direction, sector: 
 /// Trả về số bytes đã copy. Nếu trạng thái đĩa đã thay đổi kể từ khi lập kế hoạch → lỗi, không ghi.
 pub fn execute_move(plan: &Plan) -> Result<u64, String> {
     let disk = read_disk(&plan.disk_path, Mode::ReadWrite)?;
-    let recomputed = plan_move(&disk, plan.partition_number, plan.direction, plan.offset_sectors)
-        .map_err(|e| e.message())?;
+    let recomputed = plan_move(
+        &disk,
+        plan.partition_number,
+        plan.direction,
+        plan.offset_sectors,
+    )
+    .map_err(|e| e.message())?;
     if recomputed.new_start != plan.new_start {
         return Err(
             "Trạng thái đĩa đã thay đổi kể từ khi lập kế hoạch — hủy thao tác để an toàn."
@@ -279,7 +295,10 @@ pub fn execute_move(plan: &Plan) -> Result<u64, String> {
             step.src_offset,
             step.size
         );
-        println!("                 write 0x{:016X} len 0x{:X}", step.dst_offset, step.size);
+        println!(
+            "                 write 0x{:016X} len 0x{:X}",
+            step.dst_offset, step.size
+        );
     }
     close_disk(h);
     Ok(copied)
@@ -447,6 +466,10 @@ mod tests {
         let d = test_disk();
         let plan = plan_move(&d, 1, Direction::Right, 0).unwrap();
         assert_eq!(plan.delta, 0);
-        assert!(plan.warnings.iter().any(|w| w.contains("offset_sectors = 0")));
+        assert!(
+            plan.warnings
+                .iter()
+                .any(|w| w.contains("offset_sectors = 0"))
+        );
     }
 }

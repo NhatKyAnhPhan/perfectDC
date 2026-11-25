@@ -1,13 +1,42 @@
 [package]
-name = "disk_partition_mgr"
-version = "0.1.0"
+name = "perfectds"
+version = "1.0.0"
 edition = "2024"
+description = "PerfectDS - Trình quản lý & chia ổ đĩa cho Windows"
+authors = ["PerfectDS"]
+
+[lib]
+name = "perfectds"
+path = "src/lib.rs"
+
+[[bin]]
+name = "perfectds"
+path = "src/bin/perfectds.rs"
+
+[[bin]]
+name = "dpm-cli"
+path = "src/bin/dpm-cli.rs"
 
 [dependencies]
+eframe = { version = "0.31.1", default-features = false, features = ["default_fonts", "glow", "accesskit"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+base64 = "0.22"
 windows-sys = { version = "0.52", features = [
     "Win32_Foundation",
     "Win32_Security",
     "Win32_Storage_FileSystem",
+    "Win32_System_Console",
     "Win32_System_IO",
     "Win32_System_Ioctl",
+    "Win32_System_SystemInformation",
+    "Win32_UI_Shell",
+    "Win32_UI_WindowsAndMessaging",
 ] }
+
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1
+strip = true
+panic = "abort"

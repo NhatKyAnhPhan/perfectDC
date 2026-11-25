@@ -20,15 +20,15 @@ use std::mem::{offset_of, size_of};
 use std::ptr::{null, null_mut};
 
 use windows_sys::Win32::Foundation::{
-    CloseHandle, GetLastError, HANDLE, INVALID_HANDLE_VALUE, GENERIC_READ, GENERIC_WRITE,
+    CloseHandle, GENERIC_READ, GENERIC_WRITE, GetLastError, HANDLE, INVALID_HANDLE_VALUE,
 };
 use windows_sys::Win32::Storage::FileSystem::{
-    CreateFileW, GetFileSizeEx, ReadFile, SetFilePointerEx, WriteFile,
-    FILE_BEGIN, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
+    CreateFileW, FILE_BEGIN, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, GetFileSizeEx,
+    OPEN_EXISTING, ReadFile, SetFilePointerEx, WriteFile,
 };
 use windows_sys::Win32::System::IO::DeviceIoControl;
 use windows_sys::Win32::System::Ioctl::{
-    DRIVE_LAYOUT_INFORMATION_EX, DISK_GEOMETRY_EX, IOCTL_DISK_GET_DRIVE_GEOMETRY_EX,
+    DISK_GEOMETRY_EX, DRIVE_LAYOUT_INFORMATION_EX, IOCTL_DISK_GET_DRIVE_GEOMETRY_EX,
     IOCTL_DISK_GET_DRIVE_LAYOUT_EX, PARTITION_INFORMATION_EX, PARTITION_STYLE_GPT,
     PARTITION_STYLE_RAW,
 };
@@ -233,7 +233,12 @@ fn open_disk_inner(path: &str, mode: Mode) -> Result<HANDLE, String> {
         )
     };
     if h == INVALID_HANDLE_VALUE {
-        return Err(format!("CreateFileW({path:?}) thất bại: {}", unsafe { GetLastError() }));
+        let err = unsafe { GetLastError() };
+        let mut msg = format!("CreateFileW({path:?}) thất bại: {err}");
+        if err == 5 {
+            msg.push_str(" (cần chạy bằng quyền Administrator)");
+        }
+        return Err(msg);
     }
     Ok(h)
 }
@@ -365,7 +370,10 @@ pub fn copy_range_h(h: HANDLE, src: u64, dst: u64, len: u64) -> Result<u64, Stri
         let mut buf = vec![0u8; n];
         let r = read_at(h, src + off, &mut buf)?;
         if r == 0 {
-            return Err(format!("Không đọc được dữ liệu tại offset 0x{:X}", src + off));
+            return Err(format!(
+                "Không đọc được dữ liệu tại offset 0x{:X}",
+                src + off
+            ));
         }
         write_at(h, dst + off, &buf[..r])?;
         off += r as u64;
@@ -438,7 +446,7 @@ fn ioctl_layout(h: HANDLE) -> Result<(Style, Vec<PartitionInfo>), String> {
     let entry_size = size_of::<PARTITION_INFORMATION_EX>();
     let layout_size = size_of::<DRIVE_LAYOUT_INFORMATION_EX>();
     // Bộ đệm đủ lớn cho tối đa 255 phân vùng (MBR: 4, GPT: tối đa MaxPartitionCount).
-    let mut buf: Vec<u64> = vec![0; (layout_size + 255 * entry_size + 7) / 8 + 1];
+    let mut buf: Vec<u64> = vec![0; (layout_size + 255 * entry_size).div_ceil(8) + 1];
     device_ioctl(
         h,
         IOCTL_DISK_GET_DRIVE_LAYOUT_EX,
@@ -459,7 +467,11 @@ fn ioctl_layout(h: HANDLE) -> Result<(Style, Vec<PartitionInfo>), String> {
     let entry_off = offset_of!(DRIVE_LAYOUT_INFORMATION_EX, PartitionEntry);
     let mut out = Vec::with_capacity(count);
     for i in 0..count {
-        let e = unsafe { &*(base.add(entry_off + i * entry_size).cast::<PARTITION_INFORMATION_EX>()) };
+        let e = unsafe {
+            &*(base
+                .add(entry_off + i * entry_size)
+                .cast::<PARTITION_INFORMATION_EX>())
+        };
         let style_i = e.PartitionStyle;
         let e_style = style_of_style_i(style_i);
         let (mbr_type, boot, recognized, gpt_type, gpt_attrs, gpt_name) = match style_i {
@@ -537,12 +549,8 @@ fn contains_bde_header(data: &[u8]) -> bool {
             return true;
         }
     }
-    if data.len() >= 3 + BDE_SIGNATURE.len()
+    data.len() >= 3 + BDE_SIGNATURE.len()
         && bytes_eq(&data[3..3 + BDE_SIGNATURE.len()], BDE_SIGNATURE)
-    {
-        return true;
-    }
-    false
 }
 
 fn bytes_eq(a: &[u8], b: &[u8]) -> bool {
@@ -578,10 +586,10 @@ fn file_disk_info(h: HANDLE) -> Result<DiskInfo, String> {
     // Phát hiện BitLocker: đọc header phân vùng.
     for p in partitions.iter_mut() {
         let mut head = vec![0u8; 512];
-        if let Ok(n) = read_at(h, p.start_offset, &mut head) {
-            if n > 0 {
-                p.is_encrypted = contains_bde_header(&head[..n]);
-            }
+        if let Ok(n) = read_at(h, p.start_offset, &mut head)
+            && n > 0
+        {
+            p.is_encrypted = contains_bde_header(&head[..n]);
         }
     }
     Ok(DiskInfo {
@@ -692,7 +700,11 @@ fn guid_to_string(b: &[u8]) -> String {
     let d1 = u32::from_le_bytes([b[0], b[1], b[2], b[3]]);
     let d2 = u16::from_le_bytes([b[4], b[5]]);
     let d3 = u16::from_le_bytes([b[6], b[7]]);
-    format!("{d1:08x}-{d2:04x}-{d3:04x}-{}-{}", hex_str(&b[8..10]), hex_str(&b[10..16]))
+    format!(
+        "{d1:08x}-{d2:04x}-{d3:04x}-{}-{}",
+        hex_str(&b[8..10]),
+        hex_str(&b[10..16])
+    )
 }
 
 fn hex_str(b: &[u8]) -> String {

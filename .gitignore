@@ -1,2 +1,24 @@
+# --- Rust / build ---
 target/
 **/target/
+# Thư mục đóng gói bản phát hành (tạo lại bằng cargo build --release)
+dist/
+
+# --- IDE / editor ---
+.vscode/
+.idea/
+.vs/
+*.suo
+*.user
+*.swp
+*~
+
+# --- Hệ điều hành ---
+Thumbs.db
+desktop.ini
+.DS_Store
+
+# --- Log / file tạm ---
+*.log
+*.tmp
+*.bak
